@@ -1,46 +1,24 @@
-# Solana KPI Exporter
+# Solana KPI Exporter v2
 
-Rust Prometheus exporter for Solana validators and RPC nodes.
+Production-safer version.
 
-## What it exposes
+## Fixes vs previous build
 
-### Toko KPI metrics
-- Uptime target and rolling uptime ratio
-- Voting effectiveness percentage and target
-- Skip rate percentage and target
+- Keeps the **last good snapshot** on collection failure
+- Exposes `solana_kpi_scrape_success` and `solana_kpi_last_success_timestamp_unix`
+- Uses `poll_interval_secs = 60` by default
+- Uses `timeout_secs = 6` by default
+- Uses explicit `--manifest-path` during install/build
+- Includes `[workspace]` in `Cargo.toml` to avoid host root workspace pollution
 
-### Validator metrics
-- vote credits earned in current epoch
-- last vote / root slot / lag
-- delinquent status
-- activated stake
-- commission
-- leader slots / produced / skipped
-
-### RPC / node metrics
-- health
-- version
-- slot / block height / epoch
-- sync lag vs reference RPC
-- max shred insert slot / shred gap
-- snapshot slots / snapshot lag
-- identity balance / vote balance
-
-## Quick install
+## Install
 
 ```bash
 bash scripts/install.sh validator
 ```
 
-Or for RPC-only:
+## Metrics endpoint
 
 ```bash
-bash scripts/install.sh rpc
-```
-
-## Render config only
-
-```bash
-bash scripts/render-config.sh validator /etc/solana-kpi-exporter/config.toml
-bash scripts/render-config.sh rpc /etc/solana-kpi-exporter/config.toml
+curl -s http://127.0.0.1:9898/metrics
 ```

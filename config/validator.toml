@@ -4,7 +4,7 @@ mode = "validator"
 target_url = "http://45.250.254.83/rpc"
 reference_url = "https://api.mainnet-beta.solana.com"
 commitment = "finalized"
-timeout_secs = 10
+timeout_secs = 6
 
 [identity]
 node_pubkey = "BaDhUB1eWfunwD21Tu3WywyYQ9wZx5hS9WXeHHNGZUPy"
@@ -12,7 +12,7 @@ vote_pubkey = "CBSrVMzHqnjb1td6diYaqy2Nq1GotkKQBB6i5eaR1ZyR"
 
 [exporter]
 listen_addr = "0.0.0.0:9898"
-poll_interval_secs = 30
+poll_interval_secs = 60
 state_path = "/var/lib/solana-kpi-exporter/state.json"
 log_level = "info"
 
