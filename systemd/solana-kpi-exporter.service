@@ -1,0 +1,15 @@
+[Unit]
+Description=Solana KPI Exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__BINARY__ __CONFIG__
+Restart=always
+RestartSec=5
+WorkingDirectory=/opt/solana-kpi-exporter
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
