@@ -1,0 +1,38 @@
+mode = "validator"
+
+[rpc]
+target_url = "http://45.250.254.83/rpc"
+reference_url = "https://api.mainnet-beta.solana.com"
+commitment = "finalized"
+timeout_secs = 10
+
+[identity]
+node_pubkey = "BaDhUB1eWfunwD21Tu3WywyYQ9wZx5hS9WXeHHNGZUPy"
+vote_pubkey = "CBSrVMzHqnjb1td6diYaqy2Nq1GotkKQBB6i5eaR1ZyR"
+
+[exporter]
+listen_addr = "0.0.0.0:9898"
+poll_interval_secs = 30
+state_path = "/var/lib/solana-kpi-exporter/state.json"
+log_level = "info"
+
+[uptime]
+window_hours = 720
+max_sync_lag_slots = 150
+max_last_vote_lag_slots = 8
+max_root_lag_slots = 64
+require_health_ok = true
+require_not_delinquent = true
+
+[features]
+enable_vote_metrics = true
+enable_skip_rate = true
+enable_balance_metrics = true
+enable_snapshot_metrics = true
+enable_sync_metrics = true
+enable_rpc_status_metrics = true
+
+[slo]
+uptime_target_pct = 99.95
+voting_effectiveness_target_pct = 99.8
+skip_rate_target_pct = 0.0
