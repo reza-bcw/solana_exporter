@@ -461,6 +461,7 @@ struct VoteAccount {
     #[serde(rename = "lastVote")]
     last_vote: u64,
     #[serde(rename = "nodePubkey")]
+    #[allow(dead_code)]
     node_pubkey: String,
     #[serde(rename = "rootSlot")]
     root_slot: u64,
