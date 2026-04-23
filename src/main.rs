@@ -1,5 +1,11 @@
 use anyhow::{Context, Result};
-use axum::{extract::State, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::State,
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
 use chrono::{DateTime, Duration, Utc};
 use prometheus_client::{
     encoding::EncodeLabelSet,
@@ -102,6 +108,7 @@ struct Snapshot {
     scrape_duration_ms: f64,
     scrape_timestamp_unix: f64,
     last_success_timestamp_unix: f64,
+    exporter_ready: f64,
 
     rpc_health: f64,
     uptime_ratio: f64,
@@ -156,10 +163,13 @@ impl Default for Snapshot {
             scrape_duration_ms: 0.0,
             scrape_timestamp_unix: 0.0,
             last_success_timestamp_unix: 0.0,
+            exporter_ready: 0.0,
+
             rpc_health: 0.0,
             uptime_ratio: 0.0,
             uptime_target: 99.95,
             uptime_slo_met: 0.0,
+
             solana_version: String::new(),
             absolute_slot: 0.0,
             reference_slot: 0.0,
@@ -173,6 +183,7 @@ impl Default for Snapshot {
             highest_snapshot_full: 0.0,
             highest_snapshot_incremental: 0.0,
             snapshot_lag_slots: 0.0,
+
             validator_present: 0.0,
             delinquent: 0.0,
             activated_stake_sol: 0.0,
@@ -182,25 +193,52 @@ impl Default for Snapshot {
             root_slot: 0.0,
             last_vote_lag_slots: 0.0,
             root_lag_slots: 0.0,
+
             leader_slots_current_epoch: 0.0,
             produced_blocks_current_epoch: 0.0,
             skipped_slots_current_epoch: 0.0,
             skip_rate_pct: 0.0,
             skip_rate_target: 0.0,
             skip_rate_slo_met: 0.0,
+
             cluster_confirmed_blocks_current_epoch: 0.0,
             voting_effectiveness_pct: 0.0,
             voting_effectiveness_target: 99.8,
             voting_effectiveness_slo_met: 0.0,
+
             identity_balance_sol: 0.0,
             vote_balance_sol: 0.0,
         }
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SummaryView {
+    exporter_ready: f64,
+    scrape_success: f64,
+    scrape_errors_total: f64,
+    scrape_duration_ms: f64,
+    rpc_health: f64,
+    uptime_ratio: f64,
+    uptime_target: f64,
+    uptime_slo_met: f64,
+    voting_effectiveness_pct: f64,
+    voting_effectiveness_target: f64,
+    voting_effectiveness_slo_met: f64,
+    skip_rate_pct: f64,
+    skip_rate_target: f64,
+    skip_rate_slo_met: f64,
+    absolute_slot: f64,
+    sync_lag_slots: f64,
+    solana_version: String,
+    last_success_timestamp_unix: f64,
+}
+
 #[derive(Clone)]
 struct AppState {
-    registry: Arc<RwLock<Registry>>,
+    metrics_text: Arc<RwLock<String>>,
+    summary_json: Arc<RwLock<String>>,
+    ready: Arc<RwLock<bool>>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -223,6 +261,7 @@ struct VersionLabels {
 
 #[derive(Clone)]
 struct Metrics {
+    exporter_ready: Family<EmptyLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
     rpc_health: Family<EmptyLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
     uptime_ratio: Family<NodeLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
     uptime_target: Family<EmptyLabels, Gauge<f64, std::sync::atomic::AtomicU64>>,
@@ -270,6 +309,7 @@ struct Metrics {
 impl Metrics {
     fn new(registry: &mut Registry) -> Self {
         let m = Self {
+            exporter_ready: Family::default(),
             rpc_health: Family::default(),
             uptime_ratio: Family::default(),
             uptime_target: Family::default(),
@@ -314,6 +354,7 @@ impl Metrics {
             last_success_timestamp_unix: Family::default(),
         };
 
+        reg(registry, "solana_exporter_ready", "1 if exporter has at least one successful scrape.", m.exporter_ready.clone());
         reg(registry, "solana_rpc_health", "1 if getHealth is ok.", m.rpc_health.clone());
         reg(registry, "solana_kpi_uptime_ratio", "Sliding-window uptime ratio percentage.", m.uptime_ratio.clone());
         reg(registry, "solana_kpi_uptime_target", "Configured uptime target percentage.", m.uptime_target.clone());
@@ -361,10 +402,21 @@ impl Metrics {
 
     fn update(&self, cfg: &Config, s: &Snapshot) {
         let empty = EmptyLabels {};
-        let node = NodeLabels { node_pubkey: cfg.identity.node_pubkey.clone() };
-        let vote = VoteLabels { vote_pubkey: cfg.identity.vote_pubkey.clone().unwrap_or_else(|| "none".into()) };
-        let ver = VersionLabels { version: if s.solana_version.is_empty() { "unknown".into() } else { s.solana_version.clone() } };
+        let node = NodeLabels {
+            node_pubkey: cfg.identity.node_pubkey.clone(),
+        };
+        let vote = VoteLabels {
+            vote_pubkey: cfg.identity.vote_pubkey.clone().unwrap_or_else(|| "none".into()),
+        };
+        let ver = VersionLabels {
+            version: if s.solana_version.is_empty() {
+                "unknown".into()
+            } else {
+                s.solana_version.clone()
+            },
+        };
 
+        self.exporter_ready.get_or_create(&empty).set(s.exporter_ready);
         self.rpc_health.get_or_create(&empty).set(s.rpc_health);
         self.uptime_ratio.get_or_create(&node).set(s.uptime_ratio);
         self.uptime_target.get_or_create(&empty).set(s.uptime_target);
@@ -488,7 +540,10 @@ struct SnapshotSlots {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config/config.toml".to_string());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config/config.toml".to_string());
+
     let cfg = load_config(&config_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(cfg.exporter.log_level.clone())
@@ -497,77 +552,162 @@ async fn main() -> Result<()> {
     ensure_parent_dir(&cfg.exporter.state_path)?;
 
     let client = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
+        .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(cfg.rpc.timeout_secs))
         .build()
         .context("build reqwest client")?;
 
-    let mut registry = Registry::default();
-    let _metrics = Metrics::new(&mut registry);
-    let app_state = AppState { registry: Arc::new(RwLock::new(registry)) };
-    let reg_handle = app_state.registry.clone();
-    let cfg_bg = cfg.clone();
+    let initial_metrics = initial_metrics_text();
+    let initial_summary = serde_json::to_string(&SummaryView {
+        exporter_ready: 0.0,
+        scrape_success: 0.0,
+        scrape_errors_total: 0.0,
+        scrape_duration_ms: 0.0,
+        rpc_health: 0.0,
+        uptime_ratio: 0.0,
+        uptime_target: cfg.slo.uptime_target_pct,
+        uptime_slo_met: 0.0,
+        voting_effectiveness_pct: 0.0,
+        voting_effectiveness_target: cfg.slo.voting_effectiveness_target_pct,
+        voting_effectiveness_slo_met: 0.0,
+        skip_rate_pct: 0.0,
+        skip_rate_target: cfg.slo.skip_rate_target_pct,
+        skip_rate_slo_met: 0.0,
+        absolute_slot: 0.0,
+        sync_lag_slots: 0.0,
+        solana_version: "unknown".into(),
+        last_success_timestamp_unix: 0.0,
+    })?;
+
+    let state = AppState {
+        metrics_text: Arc::new(RwLock::new(initial_metrics)),
+        summary_json: Arc::new(RwLock::new(initial_summary)),
+        ready: Arc::new(RwLock::new(false)),
+    };
+
+    let bg_state = state.clone();
+    let bg_cfg = cfg.clone();
 
     tokio::spawn(async move {
-        let mut state = load_state(&cfg_bg.exporter.state_path).unwrap_or_default();
+        let mut uptime_state = load_state(&bg_cfg.exporter.state_path).unwrap_or_default();
         let mut errors_total = 0.0;
-        let mut last_good = Snapshot {
-            uptime_target: cfg_bg.slo.uptime_target_pct,
-            voting_effectiveness_target: cfg_bg.slo.voting_effectiveness_target_pct,
-            skip_rate_target: cfg_bg.slo.skip_rate_target_pct,
-            ..Snapshot::default()
-        };
+        let mut last_good: Option<Snapshot> = None;
 
         loop {
             let started = std::time::Instant::now();
-            let mut published = match collect_once(&client, &cfg_bg, &mut state).await {
+
+            let published = match collect_once(&client, &bg_cfg, &mut uptime_state).await {
                 Ok(mut snap) => {
                     snap.scrape_success = 1.0;
+                    snap.exporter_ready = 1.0;
                     snap.last_success_timestamp_unix = Utc::now().timestamp() as f64;
-                    last_good = snap.clone();
+                    last_good = Some(snap.clone());
+                    {
+                        let mut ready = bg_state.ready.write().await;
+                        *ready = true;
+                    }
                     snap
                 }
                 Err(e) => {
                     errors_total += 1.0;
                     warn!("collection failed: {:#}", e);
-                    let mut snap = last_good.clone();
-                    snap.scrape_success = 0.0;
-                    snap.scrape_errors_total = errors_total;
-                    snap
+
+                    match last_good.clone() {
+                        Some(mut snap) => {
+                            snap.scrape_success = 0.0;
+                            snap.scrape_errors_total = errors_total;
+                            snap
+                        }
+                        None => Snapshot {
+                            scrape_success: 0.0,
+                            scrape_errors_total: errors_total,
+                            scrape_duration_ms: 0.0,
+                            scrape_timestamp_unix: 0.0,
+                            last_success_timestamp_unix: 0.0,
+                            exporter_ready: 0.0,
+                            uptime_target: bg_cfg.slo.uptime_target_pct,
+                            voting_effectiveness_target: bg_cfg.slo.voting_effectiveness_target_pct,
+                            skip_rate_target: bg_cfg.slo.skip_rate_target_pct,
+                            ..Snapshot::default()
+                        },
+                    }
                 }
             };
 
-            published.scrape_duration_ms = started.elapsed().as_millis() as f64;
-            published.scrape_timestamp_unix = Utc::now().timestamp() as f64;
-            published.scrape_errors_total = errors_total;
+            let mut final_snapshot = published.clone();
+            final_snapshot.scrape_duration_ms = started.elapsed().as_millis() as f64;
+            final_snapshot.scrape_timestamp_unix = Utc::now().timestamp() as f64;
+            final_snapshot.scrape_errors_total = errors_total;
 
-            persist_state(&cfg_bg.exporter.state_path, &state).ok();
+            if final_snapshot.scrape_success > 0.0 {
+                persist_state(&bg_cfg.exporter.state_path, &uptime_state).ok();
+            }
 
-            let mut fresh = Registry::default();
-            let fresh_metrics = Metrics::new(&mut fresh);
-            fresh_metrics.update(&cfg_bg, &published);
-            let mut reg = reg_handle.write().await;
-            *reg = fresh;
+            let rendered_metrics = match render_metrics_text(&bg_cfg, &final_snapshot) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("render metrics failed: {:#}", e);
+                    initial_metrics_text()
+                }
+            };
+
+            let rendered_summary = serde_json::to_string(&SummaryView {
+                exporter_ready: final_snapshot.exporter_ready,
+                scrape_success: final_snapshot.scrape_success,
+                scrape_errors_total: final_snapshot.scrape_errors_total,
+                scrape_duration_ms: final_snapshot.scrape_duration_ms,
+                rpc_health: final_snapshot.rpc_health,
+                uptime_ratio: final_snapshot.uptime_ratio,
+                uptime_target: final_snapshot.uptime_target,
+                uptime_slo_met: final_snapshot.uptime_slo_met,
+                voting_effectiveness_pct: final_snapshot.voting_effectiveness_pct,
+                voting_effectiveness_target: final_snapshot.voting_effectiveness_target,
+                voting_effectiveness_slo_met: final_snapshot.voting_effectiveness_slo_met,
+                skip_rate_pct: final_snapshot.skip_rate_pct,
+                skip_rate_target: final_snapshot.skip_rate_target,
+                skip_rate_slo_met: final_snapshot.skip_rate_slo_met,
+                absolute_slot: final_snapshot.absolute_slot,
+                sync_lag_slots: final_snapshot.sync_lag_slots,
+                solana_version: if final_snapshot.solana_version.is_empty() {
+                    "unknown".into()
+                } else {
+                    final_snapshot.solana_version.clone()
+                },
+                last_success_timestamp_unix: final_snapshot.last_success_timestamp_unix,
+            })
+            .unwrap_or_else(|_| "{\"error\":\"summary_render_failed\"}".into());
+
+            {
+                let mut text = bg_state.metrics_text.write().await;
+                *text = rendered_metrics;
+            }
+            {
+                let mut summary = bg_state.summary_json.write().await;
+                *summary = rendered_summary;
+            }
 
             info!(
-                mode = ?cfg_bg.mode,
-                scrape_success = published.scrape_success,
-                health = published.rpc_health,
-                uptime = published.uptime_ratio,
-                voting = published.voting_effectiveness_pct,
-                skip = published.skip_rate_pct,
-                sync_lag = published.sync_lag_slots,
+                mode = ?bg_cfg.mode,
+                scrape_success = final_snapshot.scrape_success,
+                ready = final_snapshot.exporter_ready,
+                health = final_snapshot.rpc_health,
+                uptime = final_snapshot.uptime_ratio,
+                voting = final_snapshot.voting_effectiveness_pct,
+                skip = final_snapshot.skip_rate_pct,
+                sync_lag = final_snapshot.sync_lag_slots,
                 "collection finished"
             );
 
-            sleep(TokioDuration::from_secs(cfg_bg.exporter.poll_interval_secs)).await;
+            sleep(TokioDuration::from_secs(bg_cfg.exporter.poll_interval_secs)).await;
         }
     });
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(app_state);
+        .route("/summary", get(summary_handler))
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler))
+        .with_state(state);
 
     let addr: SocketAddr = cfg.exporter.listen_addr.parse().context("parse listen_addr")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -577,32 +717,97 @@ async fn main() -> Result<()> {
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let mut out = String::new();
-    let reg = state.registry.read().await;
-    match encode(&mut out, &reg) {
-        Ok(()) => (axum::http::StatusCode::OK, out),
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("encode error: {e}"),
-        ),
+    let body = { state.metrics_text.read().await.clone() };
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8".parse().unwrap());
+    (StatusCode::OK, headers, body)
+}
+
+async fn summary_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let body = { state.summary_json.read().await.clone() };
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json; charset=utf-8")],
+        body,
+    )
+}
+
+async fn healthz_handler() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+async fn readyz_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = *state.ready.read().await;
+    if ready {
+        (StatusCode::OK, Json(json!({"ready": true}))).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ready": false}))).into_response()
     }
+}
+
+fn initial_metrics_text() -> String {
+    let mut s = String::new();
+    s.push_str("# HELP solana_exporter_ready 1 if exporter has at least one successful scrape.\n");
+    s.push_str("# TYPE solana_exporter_ready gauge\n");
+    s.push_str("solana_exporter_ready{} 0.0\n");
+    s.push_str("# HELP solana_kpi_scrape_success 1 if last scrape succeeded.\n");
+    s.push_str("# TYPE solana_kpi_scrape_success gauge\n");
+    s.push_str("solana_kpi_scrape_success{} 0.0\n");
+    s
+}
+
+fn render_metrics_text(cfg: &Config, snapshot: &Snapshot) -> Result<String> {
+    let mut registry = Registry::default();
+    let metrics = Metrics::new(&mut registry);
+    metrics.update(cfg, snapshot);
+    let mut out = String::new();
+    encode(&mut out, &registry)?;
+    Ok(out)
 }
 
 async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut PersistedState) -> Result<Snapshot> {
     let version: VersionResult = rpc(client, &cfg.rpc.target_url, "getVersion", json!([])).await?;
     let health_ok = rpc_health(client, &cfg.rpc.target_url).await?;
-    let epoch_info: EpochInfo =
-        rpc(client, &cfg.rpc.target_url, "getEpochInfo", json!([{"commitment": cfg.rpc.commitment}])).await?;
-    let local_slot: u64 = rpc(client, &cfg.rpc.target_url, "getSlot", json!([{"commitment": cfg.rpc.commitment}])).await?;
-    let reference_slot: u64 = rpc(client, &cfg.rpc.reference_url, "getSlot", json!([{"commitment": cfg.rpc.commitment}])).await?;
+    let epoch_info: EpochInfo = rpc(
+        client,
+        &cfg.rpc.target_url,
+        "getEpochInfo",
+        json!([{"commitment": cfg.rpc.commitment}]),
+    )
+    .await?;
+    let local_slot: u64 = rpc(
+        client,
+        &cfg.rpc.target_url,
+        "getSlot",
+        json!([{"commitment": cfg.rpc.commitment}]),
+    )
+    .await?;
+    let reference_slot: u64 = rpc(
+        client,
+        &cfg.rpc.reference_url,
+        "getSlot",
+        json!([{"commitment": cfg.rpc.commitment}]),
+    )
+    .await?;
     let max_shred_insert_slot: u64 =
-        rpc(client, &cfg.rpc.target_url, "getMaxShredInsertSlot", json!([])).await.unwrap_or(local_slot);
-    let snapshot_slots: SnapshotSlots = rpc(client, &cfg.rpc.target_url, "getHighestSnapshotSlot", json!([]))
-        .await
-        .unwrap_or(SnapshotSlots { full: 0, incremental: 0 });
+        rpc(client, &cfg.rpc.target_url, "getMaxShredInsertSlot", json!([]))
+            .await
+            .unwrap_or(local_slot);
+
+    let snapshot_slots: SnapshotSlots =
+        rpc(client, &cfg.rpc.target_url, "getHighestSnapshotSlot", json!([]))
+            .await
+            .unwrap_or(SnapshotSlots { full: 0, incremental: 0 });
 
     let identity_balance_lamports: u64 = if cfg.features.enable_balance_metrics {
-        get_balance(client, &cfg.rpc.target_url, &cfg.identity.node_pubkey, &cfg.rpc.commitment).await.unwrap_or(0)
+        get_balance(
+            client,
+            &cfg.rpc.target_url,
+            &cfg.identity.node_pubkey,
+            &cfg.rpc.commitment,
+        )
+        .await
+        .unwrap_or(0)
     } else {
         0
     };
@@ -636,6 +841,7 @@ async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut Persiste
 
     if matches!(cfg.mode, Mode::Validator) {
         let vote_pubkey = cfg.identity.vote_pubkey.clone().context("vote_pubkey required in validator mode")?;
+
         let vote_accounts: VoteAccounts = rpc(
             client,
             &cfg.rpc.target_url,
@@ -650,9 +856,19 @@ async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut Persiste
         let is_delinquent = delinquent.is_some();
 
         let block_production: BlockProductionEnvelope = if cfg.features.enable_skip_rate {
-            rpc(client, &cfg.rpc.target_url, "getBlockProduction", json!([{ "commitment": cfg.rpc.commitment }])).await?
+            rpc(
+                client,
+                &cfg.rpc.target_url,
+                "getBlockProduction",
+                json!([{ "commitment": cfg.rpc.commitment }]),
+            )
+            .await?
         } else {
-            BlockProductionEnvelope { value: BlockProductionValue { by_identity: HashMap::new() } }
+            BlockProductionEnvelope {
+                value: BlockProductionValue {
+                    by_identity: HashMap::new(),
+                },
+            }
         };
 
         let (leader_slots, produced_blocks) = block_production
@@ -662,15 +878,23 @@ async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut Persiste
             .copied()
             .unwrap_or((0, 0));
 
-        let cluster_confirmed_blocks: u64 = block_production.value.by_identity.values().map(|v| v.1).sum();
+        let cluster_confirmed_blocks: u64 =
+            block_production.value.by_identity.values().map(|v| v.1).sum();
+
         let skipped_slots = leader_slots.saturating_sub(produced_blocks);
-        let skip_rate_pct = if leader_slots > 0 { (skipped_slots as f64 / leader_slots as f64) * 100.0 } else { 0.0 };
+        let skip_rate_pct = if leader_slots > 0 {
+            (skipped_slots as f64 / leader_slots as f64) * 100.0
+        } else {
+            0.0
+        };
+
         let credits_earned = vote
             .epoch_credits
             .iter()
             .find(|(epoch, _, _)| *epoch == epoch_info.epoch)
             .map(|(_, credits, prev)| credits.saturating_sub(*prev))
             .unwrap_or(0);
+
         let voting_effectiveness_pct = if cluster_confirmed_blocks > 0 {
             (credits_earned as f64 / (cluster_confirmed_blocks as f64 * 16.0)) * 100.0
         } else {
@@ -678,7 +902,16 @@ async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut Persiste
         };
 
         let vote_balance_sol = if cfg.features.enable_balance_metrics {
-            lamports_to_sol(get_balance(client, &cfg.rpc.target_url, &vote.vote_pubkey, &cfg.rpc.commitment).await.unwrap_or(0))
+            lamports_to_sol(
+                get_balance(
+                    client,
+                    &cfg.rpc.target_url,
+                    &vote.vote_pubkey,
+                    &cfg.rpc.commitment,
+                )
+                .await
+                .unwrap_or(0),
+            )
         } else {
             0.0
         };
@@ -699,7 +932,8 @@ async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut Persiste
         snapshot.cluster_confirmed_blocks_current_epoch = cluster_confirmed_blocks as f64;
         snapshot.voting_effectiveness_pct = voting_effectiveness_pct;
         snapshot.vote_balance_sol = vote_balance_sol;
-        snapshot.voting_effectiveness_slo_met = bool01(voting_effectiveness_pct >= cfg.slo.voting_effectiveness_target_pct);
+        snapshot.voting_effectiveness_slo_met =
+            bool01(voting_effectiveness_pct >= cfg.slo.voting_effectiveness_target_pct);
         snapshot.skip_rate_slo_met = bool01(skip_rate_pct <= cfg.slo.skip_rate_target_pct);
 
         if cfg.uptime.require_not_delinquent && is_delinquent {
@@ -722,8 +956,16 @@ async fn collect_once(client: &Client, cfg: &Config, uptime_state: &mut Persiste
 
 async fn get_balance(client: &Client, rpc_url: &str, address: &str, commitment: &str) -> Result<u64> {
     #[derive(Deserialize)]
-    struct BalanceValue { value: u64 }
-    let resp: BalanceValue = rpc(client, rpc_url, "getBalance", json!([address, {"commitment": commitment}])).await?;
+    struct BalanceValue {
+        value: u64,
+    }
+    let resp: BalanceValue = rpc(
+        client,
+        rpc_url,
+        "getBalance",
+        json!([address, {"commitment": commitment}]),
+    )
+    .await?;
     Ok(resp.value)
 }
 
@@ -772,13 +1014,19 @@ fn bool01(v: bool) -> f64 {
     if v { 1.0 } else { 0.0 }
 }
 
-async fn rpc<T: DeserializeOwned>(client: &Client, rpc_url: &str, method: &str, params: Value) -> Result<T> {
+async fn rpc<T: DeserializeOwned>(
+    client: &Client,
+    rpc_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<T> {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params
     });
+
     let resp = client
         .post(rpc_url)
         .json(&body)
@@ -787,7 +1035,12 @@ async fn rpc<T: DeserializeOwned>(client: &Client, rpc_url: &str, method: &str, 
         .with_context(|| format!("rpc send failed for {method}"))?
         .error_for_status()
         .with_context(|| format!("rpc http error for {method}"))?;
-    let envelope: RpcResponse<T> = resp.json().await.with_context(|| format!("rpc decode failed for {method}"))?;
+
+    let envelope: RpcResponse<T> = resp
+        .json()
+        .await
+        .with_context(|| format!("rpc decode failed for {method}"))?;
+
     Ok(envelope.result)
 }
 
