@@ -503,7 +503,7 @@ async fn main() -> Result<()> {
         .context("build reqwest client")?;
 
     let mut registry = Registry::default();
-    let metrics = Metrics::new(&mut registry);
+    let _metrics = Metrics::new(&mut registry);
     let app_state = AppState { registry: Arc::new(RwLock::new(registry)) };
     let reg_handle = app_state.registry.clone();
     let cfg_bg = cfg.clone();
