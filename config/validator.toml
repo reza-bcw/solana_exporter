@@ -1,8 +1,8 @@
 mode = "validator"
 
 [rpc]
-target_url = "http://45.250.254.83/rpc"
-reference_url = "http://45.250.254.83/rpc"
+target_url = "http://ip/rpc"
+reference_url = "http://ip/rpc"
 commitment = "finalized"
 timeout_secs = 4
 
